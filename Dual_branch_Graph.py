@@ -224,17 +224,15 @@ class SimilarityAdjacencyBuilder:
     errors; a complete graph is used only when no source is configured.
 
     Text scores define directed edges before optional max symmetrization.
-    Unlisted pairs have weight zero. Negative scores are clipped to zero by the
-    existing nonnegative graph propagation, and optional self-loops have weight 1.
+    Unlisted pairs, negative weights, and diagonal entries are set to zero.
     """
     def __init__(self, root_path: Optional[str] = None, adj_matrix_path: Optional[str] = None,
                  station_names_path: Optional[str] = None, top3_similarity_path: Optional[str] = None,
-                 add_self_loops: bool = True, symmetrize: bool = True):
+                 symmetrize: bool = True):
         self.root_path = root_path
         self.adj_matrix_path = _maybe_join(root_path, adj_matrix_path)
         self.station_names_path = _maybe_join(root_path, station_names_path)
         self.top3_similarity_path = _maybe_join(root_path, top3_similarity_path)
-        self.add_self_loops = bool(add_self_loops)
         self.symmetrize = bool(symmetrize)
 
     def build(self, station_names: Sequence[str], n_nodes: int) -> np.ndarray:
@@ -318,14 +316,11 @@ class SimilarityAdjacencyBuilder:
         local = np.zeros((n_nodes, n_nodes), dtype=np.float32)
         for i, a in enumerate(station_names):
             for j, b in enumerate(station_names):
-                if i == j:
-                    local[i, j] = 1.0 if self.add_self_loops else 0.0
-                else:
-                    local[i, j] = pair_scores.get((a, b), 0.0)
+                local[i, j] = pair_scores.get((a, b), 0.0)
         return self._postprocess(local)
 
     def _fallback(self, n_nodes: int) -> np.ndarray:
-        # Complete graph with self-loops; safe fallback when no adjacency source is available.
+        # Connect every pair of distinct stations when no adjacency source is available.
         local = np.ones((n_nodes, n_nodes), dtype=np.float32)
         return self._postprocess(local)
 
@@ -333,10 +328,9 @@ class SimilarityAdjacencyBuilder:
         adj = np.asarray(adj, dtype=np.float32)
         if self.symmetrize:
             adj = np.maximum(adj, adj.T)
-        if self.add_self_loops:
-            np.fill_diagonal(adj, 1.0)
         adj = np.nan_to_num(adj, nan=0.0, posinf=0.0, neginf=0.0)
         adj = np.maximum(adj, 0.0)
+        np.fill_diagonal(adj, 0.0)
         return adj
 
 
@@ -369,8 +363,9 @@ class GraphTokenPropagation(nn.Module):
 
     @staticmethod
     def _normalize_adj(adj: torch.Tensor) -> torch.Tensor:
-        # Row-normalize adjacency for stable message passing.
-        adj = adj.clamp_min(0.0)
+        # Exclude diagonal entries before normalizing supplied or restored adjacency.
+        diagonal = torch.eye(adj.size(-1), dtype=torch.bool, device=adj.device)
+        adj = adj.masked_fill(diagonal, 0.0).clamp_min(0.0)
         denom = adj.sum(dim=-1, keepdim=True).clamp_min(1e-6)
         return adj / denom
 
@@ -560,7 +555,7 @@ class Model(nn.Module):
             self.register_buffer("graph_adj", torch.tensor(adj, dtype=torch.float32), persistent=True)
         else:
             self.graph_layer = None
-            self.register_buffer("graph_adj", torch.eye(1, dtype=torch.float32), persistent=False)
+            self.register_buffer("graph_adj", torch.zeros(1, 1, dtype=torch.float32), persistent=False)
 
         # encoder.
         self.encoder = LiteEncoder(
@@ -629,7 +624,6 @@ class Model(nn.Module):
             adj_matrix_path=getattr(configs, "adj_matrix_path", getattr(configs, "adjacency_path", None)),
             station_names_path=getattr(configs, "station_names_path", None),
             top3_similarity_path=getattr(configs, "top3_similarity_path", None),
-            add_self_loops=_as_bool(getattr(configs, "graph_self_loops", True)),
             symmetrize=_as_bool(getattr(configs, "graph_symmetrize", True)),
         )
         return builder.build(station_names, self.graph_num_nodes)
