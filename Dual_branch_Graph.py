@@ -3,6 +3,8 @@
 The power branch embeds historical PV power and can aggregate station tokens
 over a graph. The Meteorology branch embeds context features and time marks.
 Cross-attention combines the branches before the forecast head.
+With SolarElevation enabled, the head uses solar elevation at each forecast
+step from the last pred_len time steps in x_mark_dec.
 
 MultiPower accepts [B, L, stations, features] or flattened [B, L, channels]
 inputs. In the former, graph_power_indices selects stations and
@@ -191,11 +193,11 @@ class LearnablePositionEmbedding(nn.Module):
 
 
 class ForecastHead(nn.Module):
-    """Map encoder tokens [B, N_tgt, P, d_model] to [B, pred_len, N_tgt]."""
+    """Predict [B, pred_len, N_tgt] with optional future solar input [B, pred_len]."""
 
     def __init__(self, patch_num: int, d_model: int, pred_len: int,
                  dropout: float = 0.1, hidden_dim: Optional[int] = None,
-                 activation: str = "gelu"):
+                 activation: str = "gelu", use_solar_elevation: bool = False):
         super().__init__()
         hidden_dim = int(hidden_dim) if hidden_dim is not None else int(d_model)
         self.flatten = nn.Flatten(start_dim=-2)
@@ -203,13 +205,21 @@ class ForecastHead(nn.Module):
         self.activation = nn.GELU() if activation == "gelu" else nn.ReLU()
         self.dropout = nn.Dropout(dropout)
         self.head = nn.Linear(hidden_dim, int(pred_len))
+        self.solar_scale = nn.Linear(hidden_dim, int(pred_len)) if use_solar_elevation else None
 
-    def forward(self, h: torch.Tensor) -> torch.Tensor:
+    def forward(self, h: torch.Tensor, future_solar: Optional[torch.Tensor] = None) -> torch.Tensor:
         feat = self.flatten(h)
         feat = self.feature_proj(feat)
         feat = self.activation(feat)
         feat = self.dropout(feat)
-        return self.head(feat).transpose(1, 2)
+        forecast = self.head(feat)  # [B, N_tgt, pred_len]
+        if self.solar_scale is not None:
+            expected_shape = (forecast.size(0), forecast.size(2))
+            if future_solar is None or future_solar.shape != expected_shape:
+                raise ValueError(f"Expected future solar elevation with shape {expected_shape}.")
+            # Apply each elevation only to its matching forecast step.
+            forecast = forecast + self.solar_scale(feat) * future_solar.to(forecast).unsqueeze(1)
+        return forecast.transpose(1, 2)
 
 
 # -----------------------------
@@ -496,7 +506,7 @@ class Model(nn.Module):
         self.meteorology_station_index = int(getattr(configs, "exog_station_index", self.main_node_index))
         self.meteorology_feature_indices = getattr(configs, "exog_feature_indices", None)
 
-        # Compute solar elevation from time marks unless a column is configured.
+        # Compute future solar elevation from decoder time marks unless a column is configured.
         self.use_solar_elevation = _as_bool(getattr(configs, "SolarElevation", False))
         self.solar_latitude_deg = -23.7
         self.solar_time_feature_indices = _parse_indices(
@@ -504,7 +514,6 @@ class Model(nn.Module):
             default=[0, 1, 2, 3, 4],
             modulo=None,
         )
-        self.solar_elevation_index = getattr(configs, "solar_elevation_index", None)
         self.solar_elevation_mark_index = getattr(configs, "solar_elevation_mark_index", None)
 
         # Branch inputs.
@@ -527,22 +536,6 @@ class Model(nn.Module):
             dropout=configs.dropout,
         )
         self.meteorology_pos_embedding = LearnablePositionEmbedding(self.patch_num, configs.d_model)
-
-        if self.use_solar_elevation:
-            self.solar_patch_embedding = LazyPatchEmbedding(
-                d_model=configs.d_model,
-                patch_len=configs.patch_len,
-                dropout=configs.dropout,
-            )
-            self.solar_pos_embedding = LearnablePositionEmbedding(self.patch_num, configs.d_model)
-            self.solar_gate = nn.Sequential(
-                nn.Linear(configs.d_model, configs.d_model),
-                nn.Sigmoid(),
-            )
-        else:
-            self.solar_patch_embedding = None
-            self.solar_pos_embedding = None
-            self.solar_gate = None
 
         # Graph network.
         if self.use_graph:
@@ -579,6 +572,7 @@ class Model(nn.Module):
             dropout=configs.dropout,
             hidden_dim=getattr(configs, "head_hidden_dim", configs.d_model),
             activation=getattr(configs, "activation", "gelu"),
+            use_solar_elevation=self.use_solar_elevation,
         )
 
     # ---------- config/index helpers ----------
@@ -680,54 +674,39 @@ class Model(nn.Module):
             parts.append(torch.zeros(B, L, 1, device=x_enc.device, dtype=x_enc.dtype))
         return torch.cat(parts, dim=-1)
 
-    def _make_solar_input(self, x_enc: torch.Tensor, x_mark_enc: Optional[torch.Tensor]) -> torch.Tensor:
-        """Return solar elevation sequence [B, L, 1].
-
-        Read a configured precomputed column or calculate elevation from time marks.
-        """
-        if self.solar_elevation_index is not None:
-            if x_enc.dim() == 4:
-                station_idx = self.meteorology_station_index % x_enc.shape[2]
-                idx = int(self.solar_elevation_index) % x_enc.shape[-1]
-                return x_enc[:, :, station_idx, idx:idx + 1]
-            idx = int(self.solar_elevation_index) % x_enc.shape[-1]
-            return x_enc[:, :, idx:idx + 1]
-
-        if x_mark_enc is None:
+    def _make_future_solar_input(self, x_mark_dec: Optional[torch.Tensor]) -> torch.Tensor:
+        """Return solar elevation [B, pred_len] in forecast order."""
+        if x_mark_dec is None:
+            raise ValueError("configs.SolarElevation=True requires future time marks in x_mark_dec.")
+        if x_mark_dec.dim() not in (3, 4) or x_mark_dec.size(-1) == 0:
+            raise ValueError("Expected x_mark_dec with shape [B, L, C] or [B, L, stations, C] with C > 0.")
+        if x_mark_dec.size(1) < self.pred_len:
             raise ValueError(
-                "configs.SolarElevation=True requires x_mark_enc unless "
-                "solar_elevation_index selects a precomputed column in x_enc."
+                f"Expected at least {self.pred_len} forecast time steps in x_mark_dec, got {x_mark_dec.size(1)}."
             )
 
-        if self.solar_elevation_mark_index is not None:
-            idx = int(self.solar_elevation_mark_index) % x_mark_enc.shape[-1]
-            if x_mark_enc.dim() == 4:
-                station_idx = self.meteorology_station_index % x_mark_enc.shape[2]
-                return x_mark_enc[:, :, station_idx, idx:idx + 1]
-            return x_mark_enc[:, :, idx:idx + 1]
+        # Decoder marks may start with label_len historical steps.
+        time_mark = x_mark_dec[:, -self.pred_len:, ...]
+        if time_mark.dim() == 4:
+            station_idx = self.meteorology_station_index % time_mark.size(2)
+            time_mark = time_mark[:, :, station_idx, :]
 
-        if x_mark_enc.dim() == 4:
-            station_idx = self.meteorology_station_index % x_mark_enc.shape[2]
-            time_mark = x_mark_enc[:, :, station_idx, :]
-        else:
-            time_mark = x_mark_enc
+        if self.solar_elevation_mark_index is not None:
+            idx = int(self.solar_elevation_mark_index) % time_mark.size(-1)
+            return time_mark[:, :, idx]
 
         if time_mark.shape[-1] < 5:
             raise ValueError(
-                f"SolarElevation requires at least 5 time features in x_mark_enc, got {time_mark.shape[-1]}. "
+                f"SolarElevation requires at least 5 time features in x_mark_dec, got {time_mark.shape[-1]}. "
                 "Expected [MinuteOfHour, HourOfDay, DayOfWeek, DayOfMonth, DayOfYear] in [-0.5, 0.5]."
             )
 
-        time_indices = [i % time_mark.shape[-1] for i in self.solar_time_feature_indices]
-        if len(time_indices) < 5:
+        if len(self.solar_time_feature_indices) < 5:
             raise ValueError(
-                f"solar_time_feature_indices must contain 5 columns, got {time_indices}."
+                f"solar_time_feature_indices must contain at least 5 columns, got {self.solar_time_feature_indices}."
             )
-        time_features = time_mark[:, :, time_indices[:5]]
-
-        solar = _estimate_solar_elevation_from_time_features(time_features, latitude_deg=self.solar_latitude_deg)
-
-        return solar.unsqueeze(-1).to(device=x_enc.device, dtype=x_enc.dtype)
+        time_features = _select_last_dim(time_mark, self.solar_time_feature_indices[:5])
+        return _estimate_solar_elevation_from_time_features(time_features, latitude_deg=self.solar_latitude_deg)
 
     # ---------- branch encoders ----------
 
@@ -768,15 +747,6 @@ class Model(nn.Module):
             target_tokens.append(z)
         return torch.stack(target_tokens, dim=1)  # [B, N_tgt, P, D]
 
-    def _apply_solar_elevation(self, z_y: torch.Tensor, x_enc: torch.Tensor, x_mark_enc: Optional[torch.Tensor]) -> torch.Tensor:
-        if not self.use_solar_elevation:
-            return z_y
-        solar = self._make_solar_input(x_enc, x_mark_enc)  # [B, L, 1]
-        z_s = self.solar_patch_embedding(solar)            # [B, P, D]
-        z_s = self.solar_pos_embedding(z_s)
-        gate = self.solar_gate(z_s).unsqueeze(1)           # [B, 1, P, D]
-        return z_y + gate * z_s.unsqueeze(1)
-
     # ---------- forecast ----------
 
     def forecast_lite(self, x_enc: torch.Tensor, x_mark_enc: Optional[torch.Tensor],
@@ -785,7 +755,6 @@ class Model(nn.Module):
         x_enc, means, stdev = self._normalize(x_enc)
 
         power_tokens = self._encode_power(x_enc, graph_adj=graph_adj)
-        power_tokens = self._apply_solar_elevation(power_tokens, x_enc, x_mark_enc)
 
         meteorology_input = self._make_meteorology_input(x_enc, x_mark_enc)
         meteorology_tokens = self.meteorology_patch_embedding(meteorology_input)
@@ -799,7 +768,8 @@ class Model(nn.Module):
         enc_out = enc_out.reshape(B, n_targets, P, D)
 
         # Head predicts normalized target, then denormalize by target/main station stats.
-        dec_out = self.head(enc_out)  # [B, pred_len, N_tgt]
+        future_solar = self._make_future_solar_input(x_mark_dec) if self.use_solar_elevation else None
+        dec_out = self.head(enc_out, future_solar=future_solar)  # [B, pred_len, N_tgt]
         dec_out = self._denormalize_targets(dec_out, means, stdev)
         return dec_out
 
